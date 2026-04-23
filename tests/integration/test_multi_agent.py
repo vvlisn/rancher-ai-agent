@@ -386,6 +386,143 @@ def test_delegate_to_child_agent_with_tool():
     finally:
         LLMManager._instance = None
 
+def test_delegate_to_child_agent_with_ui_tools():
+    """Tests that child agents work with UI tools and dispatch <processing-ui-tools/> message."""
+    from app.services.ui_tools.models import UITool, UIToolSchema, UIToolsConfig, UIToolsConfigData
+    from app.services.agent.child import ChildAgentBuilder
+    from unittest.mock import patch, MagicMock
+    import json
+
+    # Create a mock UI tool
+    schema = UIToolSchema(
+        type="object",
+        properties={"name": {"type": "string", "description": "Pod name"}},
+        required=["name"]
+    )
+    ui_tool = UITool(
+        name="show-yaml",
+        description="Display resource in YAML format",
+        prompt="Show resource YAML",
+        category="viewer",
+        schema=schema,
+        metadata={},
+        enabled=True
+    )
+
+    fake_prompt = "show the pod"
+    prompts = [fake_prompt]
+
+    fake_llm_responses = [
+        # Parent agent routes to math-agent
+        AIMessage(content=MATH_AGENT_NAME),
+        # Child agent responds with pod information
+        AIMessage(content="The pod is running successfully with 3 replicas."),
+    ]
+    
+    fake_llm = FakeMessagesListChatModelWithTools(responses=fake_llm_responses)
+    LLMManager._instance = fake_llm
+
+    try:
+        # Create agent configs with UI tools enabled
+        math_config = AgentConfig(
+            name=MATH_AGENT_NAME,
+            displayName="Math Agent",
+            description="Agent that can perform addition operations",
+            system_prompt=MATH_AGENT_PROMPT,
+            mcp_url="http://localhost:8001/mcp",
+            authentication=AuthenticationType.NONE,
+            ui_tools_selectors=["show-yaml"]  # Enable UI tools for this agent
+        )
+        
+        calc_config = AgentConfig(
+            name=CALCULATOR_AGENT_NAME,
+            displayName="Calculator Agent",
+            description="Agent that can perform multiplication operations",
+            system_prompt=CALCULATOR_AGENT_PROMPT,
+            mcp_url="http://localhost:8002/mcp",
+            authentication=AuthenticationType.NONE,
+        )
+        
+        # Patch ChildAgentBuilder to include child_agents attribute
+        original_init = ChildAgentBuilder.__init__
+
+        def patched_init(self, *args, **kwargs):
+            original_init(self, *args, **kwargs)
+            if not hasattr(self, 'child_agents'):
+                self.child_agents = []
+
+        with patch.object(ChildAgentBuilder, '__init__', patched_init):
+            # Patch the load_agent_configs to return our configured agents
+            with patch('app.services.agent.factory.load_agent_configs') as mock_load:
+                mock_load.return_value = [math_config, calc_config]
+                
+                # Patch load_ui_tools_from_configmap to return our UI tools config
+                with patch('app.services.agent.base.load_ui_tools_from_configmap') as mock_load_configmap:
+                    # Setup to return the UI tool and config directly
+                    ui_tools_config = UIToolsConfigData(
+                        tools=[ui_tool],
+                        config=UIToolsConfig(enabled=True, max_tools=5, system_prompt="Select relevant UI tools")
+                    )
+                    mock_load_configmap.return_value = ui_tools_config
+                    
+                    # Mock the UI tools selector
+                    with patch('app.services.agent.base.create_ui_tools_selector') as mock_selector_factory:
+                        mock_selector = MagicMock()
+                        mock_selector_factory.return_value = mock_selector
+                        # Mock select_tools to return a formatted UI tool
+                        mock_selector.select_tools.return_value = [
+                            {
+                                "toolName": "show-yaml",
+                                "description": "Display resource in YAML format",
+                                "prompt": "Show resource YAML",
+                            }
+                        ]
+                        
+                        messages = []
+                        with client.websocket_connect("/v1/ws/messages") as websocket:
+                            # Consume any initial messages from the server
+                            websocket.receive_text()
+
+                            for prompt in prompts:
+                                # Send JSON request with tools configuration
+                                request = json.dumps({
+                                    "prompt": prompt,
+                                    "tools": {"name": "default", "tools": ["show-yaml"]}
+                                })
+                                websocket.send_text(request)
+                            
+                            # Collect ALL messages from the websocket
+                            msg = ""
+                            while True:
+                                chunk = websocket.receive_text()
+                                messages.append(chunk)
+                                msg += chunk
+                                if msg.endswith("</message>"):
+                                    break
+                        
+                        full_stream = "".join(messages)
+                        
+                        # Verify workflow correctness: agent metadata and response in stream
+                        assert "<agent-metadata>" in full_stream, "Response should contain agent metadata"
+                        assert MATH_AGENT_NAME in full_stream, f"Response should mention {MATH_AGENT_NAME}"
+                        assert "The pod is running successfully with 3 replicas." in full_stream, "Response should contain LLM response"
+                        
+                        # Verify UI tools dispatch: processing message sent
+                        assert "<processing-ui-tools/>" in full_stream, "Missing <processing-ui-tools/> dispatch message"
+                        
+                        # Verify UI tools were dispatched
+                        assert "<ui-tools>" in full_stream, "Missing <ui-tools> dispatch message"
+                        
+                        mock_load_configmap.assert_called(), "UI tools config should be loaded from ConfigMap"
+                        mock_selector_factory.assert_called(), "Selector factory should be called"
+                        mock_selector.select_tools.assert_called(), "Selector should select tools"
+                        
+                        # Verify LLM was called correctly
+                        assert len(fake_llm.all_calls) == 2, "Expected 2 LLM calls (1 routing + 1 child agent)"
+
+    finally:
+        LLMManager._instance = None
+
 def test_summary():
     fake_prompt_1 = "fake prompt 1"
     fake_prompt_2 = "fake prompt 2"

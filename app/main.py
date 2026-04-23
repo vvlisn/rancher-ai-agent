@@ -69,6 +69,8 @@ async def lifespan(app: FastAPI):
         logging.info(f"Startup: {len(configs)} AIAgentConfig CRDs in the cluster.")
 
         app.memory_manager = await create_memory_manager()
+        
+        # Start the AIAgentConfig watcher
         app.kopf_manager = create_kopf_manager()
         app.kopf_manager.start()
 

@@ -2,6 +2,7 @@
 Unit tests for agent building functionality including tool execution,
 human validation, conversation summarization, and error handling.
 """
+from app.services.ui_tools.models import UIToolsConfig
 import pytest
 import json
 
@@ -968,7 +969,7 @@ async def test_handle_interrupt_cancels_on_no_response(mock_llm, mock_checkpoint
     }
     
     with patch("langgraph.types.interrupt", return_value="no"):
-        should_continue, interrupt_msg = await builder.handle_interrupt(validation_tools, tool_call, {})
+        should_continue, interrupt_msg, _ = await builder.handle_interrupt(validation_tools, tool_call, {})
     
     assert should_continue is False
     assert interrupt_msg is not None
@@ -1000,7 +1001,7 @@ async def test_handle_interrupt_continues_on_yes_response(mock_llm, mock_checkpo
     }
     
     with patch("langgraph.types.interrupt", return_value="yes"):
-        should_continue, interrupt_msg = await builder.handle_interrupt(validation_tools, tool_call, {})
+        should_continue, interrupt_msg, _ = await builder.handle_interrupt(validation_tools, tool_call, {})
     
     assert should_continue is True
     assert interrupt_msg is not None
@@ -1093,7 +1094,7 @@ async def test_handle_interrupt_dispatches_subagent_choice_event(mock_interrupt,
 
     mock_interrupt.return_value = "yes"
 
-    should_continue, _ = await builder.handle_interrupt(validation_tools, tool_call, state)
+    should_continue, _, _ = await builder.handle_interrupt(validation_tools, tool_call, state)
 
     assert should_continue is True
     
@@ -1297,3 +1298,622 @@ def test_call_model_node_no_routing_when_only_one_sibling(mock_llm, mock_tools, 
     assert isinstance(system_message, SystemMessage)
     assert system_message.content == "You are a specialized agent."
     assert "highly specialized Assistant" not in system_message.content
+
+
+# ============================================================================
+# UI Tools Tests
+# ============================================================================
+
+class TestDispatchUIToolsEvent:
+    """Test _dispatch_ui_tools_event method."""
+    
+    @patch('app.services.agent.base.load_ui_tools_from_configmap')
+    @patch('app.services.agent.base.create_ui_tools_selector')
+    @patch('app.services.agent.base.dispatch_custom_event')
+    def test_dispatch_ui_tools_event_success(
+        self, mock_dispatch, mock_create_selector, mock_load_configmap,
+        mock_llm, mock_checkpointer, mock_config
+    ):
+        """Test successfully dispatching UI tools."""
+        from app.services.ui_tools.models import UITool, UIToolSchema, UIToolsConfig, UIToolsConfigData
+        
+        builder = BaseAgentBuilder(
+            llm=mock_llm,
+            tools=[],
+            system_prompt="Test",
+            checkpointer=mock_checkpointer,
+            agent_config=MagicMock()
+        )
+        builder.child_agents = []  # Mock child_agents
+        
+        
+        schema = UIToolSchema(type="object", properties={}, required=[])
+        tool = UITool(
+            name="test-selector",
+            description="Test selector",
+            prompt="Select",
+            category="selector",
+            schema=schema,
+            metadata={},
+            enabled=True
+        )
+        
+        mock_config_data = UIToolsConfigData(
+            config=UIToolsConfig(enabled=True, max_tools=5, system_prompt="Test"),
+            tools=[tool]
+        )
+        mock_load_configmap.return_value = mock_config_data
+        
+        mock_selector = MagicMock()
+        mock_selector.select_tools.return_value = [
+            {"toolName": "test-selector", "input": {"resource": "pod"}}
+        ]
+        mock_create_selector.return_value = mock_selector
+        
+        state = {
+            "messages": [HumanMessage(content="test")],
+            "selected_agent": {"name": "rancher"}
+        }
+        
+        config = {
+            "configurable": {
+                "request_id": "req-123",
+                "request_metadata": {
+                    "ui_tools": {"name": "default", "tools": ["test-selector"]}
+                }
+            }
+        }
+        
+        # Execute
+        with patch.object(builder, '_dispatch_ui_tools'):
+            result = builder._dispatch_ui_tools_event(state, config)
+        
+        # Verify
+        assert len(result) == 1
+        assert result[0]["toolName"] == "test-selector"
+    
+    @patch('app.services.agent.base.dispatch_custom_event')
+    def test_dispatch_ui_tools_event_missing_config_name(
+        self, mock_dispatch, mock_llm, mock_checkpointer
+    ):
+        """Test skipping dispatch when config name is missing."""
+        builder = BaseAgentBuilder(
+            llm=mock_llm,
+            tools=[],
+            system_prompt="Test",
+            checkpointer=mock_checkpointer,
+            agent_config=MagicMock()
+        )
+        
+        state = {"messages": [HumanMessage(content="test")]}
+        config = {
+            "configurable": {
+                "request_id": "req-123",
+                "request_metadata": {"ui_tools": {}}  # Missing name
+            }
+        }
+        
+        result = builder._dispatch_ui_tools_event(state, config)
+        
+        assert result == []
+    
+    @patch('app.services.agent.base.load_ui_tools_from_configmap')
+    @patch('app.services.agent.base.dispatch_custom_event')
+    def test_dispatch_ui_tools_event_disabled_config(
+        self, mock_dispatch, mock_load_configmap, mock_llm, mock_checkpointer
+    ):
+        """Test skipping dispatch when config is disabled."""
+        from app.services.ui_tools.models import UIToolsConfig
+        
+        builder = BaseAgentBuilder(
+            llm=mock_llm,
+            tools=[],
+            system_prompt="Test",
+            checkpointer=mock_checkpointer,
+            agent_config=MagicMock()
+        )
+        
+        mock_ui_tools_config = MagicMock()
+        mock_load_configmap.return_value = mock_ui_tools_config
+        
+        mock_config_data = MagicMock()
+        mock_config_data.config = UIToolsConfig(enabled=False)
+        mock_ui_tools_config.get_tools_config.return_value = mock_config_data
+        
+        state = {"messages": [HumanMessage(content="test")]}
+        config = {
+            "configurable": {
+                "request_id": "req-123",
+                "request_metadata": {"ui_tools": {"name": "default"}}
+            }
+        }
+        
+        result = builder._dispatch_ui_tools_event(state, config)
+        
+        assert result == []
+
+
+class TestDispatchUITools:
+    """Test _dispatch_ui_tools method."""
+    
+    @patch('app.services.agent.base.dispatch_custom_event')
+    def test_dispatch_ui_tools_single_tool(self, mock_dispatch, mock_llm, mock_checkpointer):
+        """Test dispatching a single UI tool."""
+        builder = BaseAgentBuilder(
+            llm=mock_llm,
+            tools=[],
+            system_prompt="Test",
+            checkpointer=mock_checkpointer,
+            agent_config=MagicMock()
+        )
+        
+        tools = [{"toolName": "selector", "input": {"resource": "pod"}}]
+        
+        builder._dispatch_ui_tools(tools)
+        
+        mock_dispatch.assert_called_once()
+        call_args = mock_dispatch.call_args
+        assert call_args[0][0] == "ui_tools"
+        assert "selector" in call_args[0][1]
+    
+    @patch('app.services.agent.base.dispatch_custom_event')
+    def test_dispatch_ui_tools_multiple_tools(self, mock_dispatch, mock_llm, mock_checkpointer):
+        """Test dispatching multiple UI tools."""
+        builder = BaseAgentBuilder(
+            llm=mock_llm,
+            tools=[],
+            system_prompt="Test",
+            checkpointer=mock_checkpointer,
+            agent_config=MagicMock()
+        )
+        
+        tools = [
+            {"toolName": "selector", "input": {"resource": "pod"}},
+            {"toolName": "viewer", "input": {"format": "yaml"}}
+        ]
+        
+        builder._dispatch_ui_tools(tools)
+        
+        mock_dispatch.assert_called_once()
+        call_args = mock_dispatch.call_args
+        assert "selector" in call_args[0][1]
+        assert "viewer" in call_args[0][1]
+
+
+class TestUIToolsNode:
+    """Test ui_tools_node method."""
+    
+    @patch('app.services.agent.base.load_ui_tools_from_configmap')
+    @patch('app.services.agent.base.create_ui_tools_selector')
+    @patch('app.services.agent.base.dispatch_custom_event')
+    def test_ui_tools_node_success(
+        self, mock_dispatch, mock_create_selector, mock_ui_tools_config,
+        mock_llm, mock_checkpointer, mock_config
+    ):
+        """Test ui_tools_node successfully selects and saves tools."""
+        from app.services.ui_tools.models import UITool, UIToolSchema, UIToolsConfigData
+        
+        builder = BaseAgentBuilder(
+            llm=mock_llm,
+            tools=[],
+            system_prompt="Test",
+            checkpointer=mock_checkpointer,
+            agent_config=MagicMock()
+        )
+        
+        
+        schema = UIToolSchema(type="object", properties={}, required=[])
+        tool = UITool(
+            name="test-selector",
+            description="Test selector",
+            prompt="Select",
+            category="selector",
+            schema=schema,
+            metadata={},
+            enabled=True
+        )
+        
+        mock_config_data = UIToolsConfigData(
+            config=UIToolsConfig(enabled=True, max_tools=5, system_prompt="Test"),
+            tools=[tool]
+        )
+        mock_ui_tools_config.get_tools_config.return_value = mock_config_data
+        
+        mock_selector = MagicMock()
+        mock_selector.select_tools.return_value = [
+            {"toolName": "test-selector", "input": {"resource": "pod"}}
+        ]
+        mock_create_selector.return_value = mock_selector
+        
+        state = {
+            "messages": [
+                HumanMessage(content="test", additional_kwargs={"request_id": "req-123"}),
+                AIMessage(content="response", additional_kwargs={"request_id": "req-123"})
+            ],
+            "selected_agent": {"name": "rancher"}
+        }
+        
+        config = {
+            "configurable": {
+                "request_id": "req-123",
+                "request_metadata": {
+                    "ui_tools": {"name": "default", "tools": ["test-selector"]}
+                }
+            }
+        }
+        
+        # Execute
+        with patch.object(builder, '_dispatch_ui_tools'):
+            result = builder.ui_tools_node(state, config)
+        
+        # Verify
+        assert "messages" in result
+
+
+class TestFilteredUITools:
+    """Test UI tools with filtered tools from request metadata."""
+    
+    @patch('app.services.agent.base.load_ui_tools_from_configmap')
+    @patch('app.services.agent.base.create_ui_tools_selector')
+    @patch('app.services.agent.base.dispatch_custom_event')
+    def test_dispatch_ui_tools_with_filtered_tools(
+        self, mock_dispatch, mock_create_selector, mock_ui_tools_config,
+        mock_llm, mock_checkpointer
+    ):
+        """Test that only filtered tools are selected from available tools."""
+        from app.services.ui_tools.models import UITool, UIToolSchema, UIToolsConfig, UIToolsConfigData
+        
+        builder = BaseAgentBuilder(
+            llm=mock_llm,
+            tools=[],
+            system_prompt="Test",
+            checkpointer=mock_checkpointer,
+            agent_config=MagicMock()
+        )
+        builder.child_agents = []
+        
+        
+        schema = UIToolSchema(type="object", properties={}, required=[])
+        
+        # Create multiple tools
+        selector_tool = UITool(
+            name="test-selector",
+            description="Test selector",
+            prompt="Select",
+            category="selector",
+            schema=schema,
+            metadata={},
+            enabled=True
+        )
+        viewer_tool = UITool(
+            name="test-viewer",
+            description="Test viewer",
+            prompt="View",
+            category="viewer",
+            schema=schema,
+            metadata={},
+            enabled=True
+        )
+        other_tool = UITool(
+            name="test-other",
+            description="Test other",
+            prompt="Other",
+            category="other",
+            schema=schema,
+            metadata={},
+            enabled=True
+        )
+        
+        # All tools available
+        mock_config_data = UIToolsConfigData(
+            config=UIToolsConfig(enabled=True, max_tools=5, system_prompt="Test"),
+            tools=[selector_tool, viewer_tool, other_tool]
+        )
+        mock_ui_tools_config.return_value = mock_config_data
+        
+        # Selector only selects filtered ones
+        mock_selector = MagicMock()
+        mock_selector.select_tools.return_value = [
+            {"toolName": "test-selector", "input": {"resource": "pod"}},
+            {"toolName": "test-viewer", "input": {"format": "yaml"}}
+        ]
+        mock_create_selector.return_value = mock_selector
+        
+        state = {
+            "messages": [HumanMessage(content="test")],
+            "selected_agent": {"name": "rancher"}
+        }
+        
+        config = {
+            "configurable": {
+                "request_id": "req-123",
+                "request_metadata": {
+                    "ui_tools": {
+                        "name": "default",
+                        "tools": ["test-selector", "test-viewer"]  # Filter: only these tools
+                    }
+                }
+            }
+        }
+        
+        # Execute
+        with patch.object(builder, '_dispatch_ui_tools'):
+            result = builder._dispatch_ui_tools_event(state, config)
+        
+        # Verify filtered tools are selected
+        assert len(result) == 2
+        tool_names = [tool["toolName"] for tool in result]
+        assert "test-selector" in tool_names
+        assert "test-viewer" in tool_names
+        assert "test-other" not in tool_names
+    
+    @patch('app.services.agent.base.load_ui_tools_from_configmap')
+    @patch('app.services.agent.base.create_ui_tools_selector')
+    @patch('app.services.agent.base.dispatch_custom_event')
+    def test_dispatch_ui_tools_empty_filtered_list(
+        self, mock_dispatch, mock_create_selector, mock_ui_tools_config,
+        mock_llm, mock_checkpointer
+    ):
+        """Test skipping dispatch when tools filter list is empty."""
+        builder = BaseAgentBuilder(
+            llm=mock_llm,
+            tools=[],
+            system_prompt="Test",
+            checkpointer=mock_checkpointer,
+            agent_config=MagicMock()
+        )
+        
+        state = {"messages": [HumanMessage(content="test")]}
+        config = {
+            "configurable": {
+                "request_id": "req-123",
+                "request_metadata": {
+                    "ui_tools": {
+                        "name": "default",
+                        "tools": []  # Empty filter
+                    }
+                }
+            }
+        }
+        
+        result = builder._dispatch_ui_tools_event(state, config)
+        
+        assert result == []
+
+
+class TestPreprocessedUIToolsWithConfirmation:
+    """Test preprocessed UI tools (show-yaml, show-yaml-diff) with confirmation workflow."""
+    
+    @pytest.mark.asyncio
+    @patch('app.services.agent.base.dispatch_custom_event')
+    @patch('langgraph.types.interrupt')
+    async def test_preprocessed_tools_dispatch_before_interrupt(
+        self, mock_interrupt, mock_dispatch, mock_llm, mock_checkpointer
+    ):
+        """Test that handle_interrupt works with config parameter for UI tools dispatch."""
+        # Setup validator tools with proper JSON response structure
+        validation_tools = ["patchKubernetesResource"]
+        
+        # Create a plan tool that returns proper JSON structure for UI tools extraction
+        plan_response = json.dumps({
+            "type": "patch",
+            "resource": {
+                "kind": "Pod",
+                "name": "test-pod",
+                "namespace": "default"
+            },
+            "payload": {
+                "original": "apiVersion: v1\nkind: Pod",
+                "patched": "apiVersion: v1\nkind: Pod\nmodified: true"
+            }
+        })
+        plan_tool = MockTool("patchKubernetesResourcePlan", plan_response)
+        regular_tool = MockTool("patchKubernetesResource", "patch applied")
+        
+        builder = BaseAgentBuilder(
+            llm=mock_llm,
+            tools=[regular_tool, plan_tool],
+            system_prompt="Test",
+            checkpointer=mock_checkpointer,
+            agent_config=MagicMock()
+        )
+        
+        # Tool call requiring confirmation
+        tool_call = {
+            "name": "patchKubernetesResource",
+            "args": {
+                "patch": "[]",
+                "name": "test-pod",
+                "kind": "Pod",
+                "cluster": "local",
+                "namespace": "default"
+            }
+        }
+        
+        state = {
+            "messages": [HumanMessage(content="patch resource")],
+            "selected_agent": {"name": "rancher", "mode": "auto"}
+        }
+        
+        config = {
+            "configurable": {
+                "request_id": "req-123",
+                "request_metadata": {
+                    "ui_tools": {
+                        "name": "default",
+                        "tools": ["show-yaml", "show-yaml-diff"]
+                    }
+                }
+            }
+        }
+        
+        mock_interrupt.return_value = "yes"
+        
+        # Execute handle_interrupt with config (ui tools will be dispatched if path executes)
+        should_continue, interrupt_msg, ui_tools = await builder.handle_interrupt(
+            validation_tools, tool_call, state, config
+        )
+        
+        # Verify confirmation workflow succeeded
+        assert should_continue is True
+        assert interrupt_msg is not None
+        assert "<confirmation-response>" in interrupt_msg
+        assert isinstance(ui_tools, list)
+        # Verify UI tools are populated with show-yaml-diff (for patch operations)
+        assert len(ui_tools) > 0
+        assert ui_tools[0]["toolName"] == "show-yaml-diff"
+        assert "input" in ui_tools[0]
+    
+    @pytest.mark.asyncio
+    @patch('app.services.agent.base.dispatch_custom_event')
+    @patch('langgraph.types.interrupt')
+    async def test_preprocessed_tools_confirmation_rejected(
+        self, mock_interrupt, mock_dispatch, mock_llm, mock_checkpointer
+    ):
+        """Test that preprocessed tools dispatch happens before user rejects confirmation."""
+        # Create a plan tool that returns proper JSON structure for UI tools extraction
+        plan_response = json.dumps({
+            "type": "create",
+            "resource": {
+                "kind": "Pod",
+                "name": "test-pod",
+                "namespace": "default"
+            },
+            "payload": {
+                "yaml": "apiVersion: v1\nkind: Pod\nmetadata:\n  name: test-pod"
+            }
+        })
+        validation_tools = ["createKubernetesResource"]
+        plan_tool = MockTool("createKubernetesResourcePlan", plan_response)
+        regular_tool = MockTool("createKubernetesResource", "resource created")
+        
+        builder = BaseAgentBuilder(
+            llm=mock_llm,
+            tools=[regular_tool, plan_tool],
+            system_prompt="Test",
+            checkpointer=mock_checkpointer,
+            agent_config=MagicMock()
+        )
+        
+        tool_call = {
+            "name": "createKubernetesResource",
+            "args": {"name": "test-pod", "kind": "Pod", "cluster": "local", "yaml": "apiVersion: v1"}
+        }
+        
+        state = {"messages": [HumanMessage(content="create resource")]}
+        
+        config = {
+            "configurable": {
+                "request_id": "req-789",
+                "request_metadata": {
+                    "ui_tools": {
+                        "name": "default",
+                        "tools": ["show-yaml"]
+                    }
+                }
+            }
+        }
+        
+        # User rejects confirmation
+        mock_interrupt.return_value = "no"
+        
+        # Execute with config so UI tools can be extracted and dispatched
+        should_continue, interrupt_msg, ui_tools = await builder.handle_interrupt(
+            validation_tools, tool_call, state, config
+        )
+        
+        # Verify execution was rejected
+        assert should_continue is False
+        assert interrupt_msg is not None
+        assert isinstance(ui_tools, list)
+        # Verify UI tools are populated with show-yaml (for create operations)
+        assert len(ui_tools) > 0
+        assert ui_tools[0]["toolName"] == "show-yaml"
+        assert "input" in ui_tools[0]
+
+
+class TestUIToolsWithMCPContext:
+    """Test UI tools selection with MCP response context."""
+    
+    @patch('app.services.agent.base.load_ui_tools_from_configmap')
+    @patch('app.services.agent.base.create_ui_tools_selector')
+    @patch('app.services.agent.base.dispatch_custom_event')
+    def test_ui_tools_selected_with_mcp_response_context(
+        self, mock_dispatch, mock_create_selector, mock_ui_tools_config,
+        mock_llm, mock_checkpointer
+    ):
+        """Test that UI tools are selected with MCP response context."""
+        from app.services.ui_tools.models import UITool, UIToolSchema, UIToolsConfig, UIToolsConfigData
+        
+        builder = BaseAgentBuilder(
+            llm=mock_llm,
+            tools=[],
+            system_prompt="Test",
+            checkpointer=mock_checkpointer,
+            agent_config=MagicMock()
+        )
+        builder.child_agents = []
+        
+        
+        schema = UIToolSchema(type="object", properties={}, required=[])
+        tool = UITool(
+            name="resource-viewer",
+            description="View resource",
+            prompt="View",
+            category="viewer",
+            schema=schema,
+            metadata={},
+            enabled=True
+        )
+        
+        mock_config_data = UIToolsConfigData(
+            config=UIToolsConfig(enabled=True, max_tools=5, system_prompt="Test"),
+            tools=[tool]
+        )
+        mock_ui_tools_config.return_value = mock_config_data
+        
+        mock_selector = MagicMock()
+        mock_selector.select_tools.return_value = [
+            {"toolName": "resource-viewer", "input": {"format": "yaml"}}
+        ]
+        mock_create_selector.return_value = mock_selector
+        
+        # Create state with MCP response
+        mcp_response_msg = ToolMessage(
+            content='{"resources": [{"id": "pod-123", "name": "test-pod"}]}',
+            tool_call_id="mcp-1",
+            name="get-resources",
+            additional_kwargs={}
+        )
+        
+        state = {
+            "messages": [
+                HumanMessage(content="get resources"),
+                AIMessage(content="Fetching resources..."),
+                mcp_response_msg
+            ],
+            "selected_agent": {"name": "rancher"}
+        }
+        
+        config = {
+            "configurable": {
+                "request_id": "req-123",
+                "request_metadata": {
+                    "ui_tools": {
+                        "name": "default",
+                        "tools": ["resource-viewer"]
+                    }
+                }
+            }
+        }
+        
+        # Execute
+        with patch.object(builder, '_dispatch_ui_tools'):
+            result = builder._dispatch_ui_tools_event(state, config)
+        
+        # Verify selector was called with MCP context
+        assert len(result) == 1
+        assert result[0]["toolName"] == "resource-viewer"
+        
+        # Verify selector.select_tools was called (with mcp_response included in context)
+        mock_selector.select_tools.assert_called_once()

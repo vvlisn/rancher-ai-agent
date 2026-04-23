@@ -4,7 +4,9 @@ Base agent builder with shared logic for all agent types.
 
 import json
 import logging
+from langchain.messages import AIMessage
 import langgraph.types
+import yaml
 
 from langchain_core.messages import ToolMessage, HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
@@ -15,6 +17,8 @@ from ollama import ResponseError
 from langchain_core.callbacks.manager import dispatch_custom_event
 from .loader import AgentConfig
 from .state import AgentState
+from ..ui_tools.loader import load_ui_tools_from_configmap
+from ..ui_tools.selector import create_ui_tools_selector, filter_tool
 
 INTERRUPT_CANCEL_MESSAGE = "tool execution cancelled by the user"
 INTERRUPT_PREVIOUS_TOOL_FAILED_MESSAGE = "tool execution cancelled because previous tool call failed"
@@ -103,6 +107,285 @@ class BaseAgentBuilder:
                 "msg_count": len(state["messages"])
             }
         }
+
+    def _extract_context_for_tool_selection(self, state: AgentState, config: RunnableConfig) -> tuple[str, str, str, str]:
+        """
+        Extracts and formats context from conversation for UI tool selection.
+        
+        Collects the most recent user message, assistant message, and MCP response data
+        to provide context for tool selection decisions.
+        
+        Args:
+            state: The current agent state containing messages
+            config: The runtime configuration containing request_id
+            
+        Returns:
+            Tuple of (user_message, ai_message, mcp_response, mcp_data)
+        """
+        request_id = config["configurable"]["request_id"]
+        user_message = ''
+        ai_message = ''
+        mcp_data = ''
+        
+        # Collect recent messages (user, assistant, tool results) for current request
+        for msg in reversed(state["messages"][-10:]):
+            additional_kwargs = msg.additional_kwargs if hasattr(msg, "additional_kwargs") else {}
+
+            # Only consider messages from the current request context
+            if request_id != additional_kwargs.get("request_id", ""):
+                break
+
+            # All messages collected, early exit
+            if user_message and ai_message and mcp_data:
+                break
+
+            if hasattr(msg, "text") and isinstance(msg.text, str):
+                if isinstance(msg, HumanMessage) and not user_message:
+                    if "request_metadata" in additional_kwargs:
+                        request_metadata = additional_kwargs["request_metadata"]
+                        user_input = request_metadata.get("user_input", "")
+                        context = request_metadata.get("context", {})
+                        user_message += f"\n[User Message]: {user_input} - ui context: {context}"
+                    if not user_message:
+                        user_message += f"\n[User Message]: {msg.text}"
+                elif isinstance(msg, AIMessage) and not ai_message:
+                    ai_message += f"\n[Assistant Message]: {msg.text}"
+                
+                # Collect the mcp result's payloads
+                elif isinstance(msg, ToolMessage) and not mcp_data:
+                    mcp_data = self._convert_tool_message_to_context(msg.content)
+
+        # Collect MCP response resources from all messages
+        mcp_response = self._extract_mcp_responses(state)
+        
+        return user_message, ai_message, mcp_response, mcp_data
+
+    def _convert_tool_message_to_context(self, content: str) -> str:
+        """
+        Converts a tool message content to formatted context (YAML format).
+        
+        Args:
+            content: The raw tool message content (usually JSON)
+            
+        Returns:
+            Formatted content string with MCP result payloads label
+        """
+        try:
+            parsed = json.loads(content)
+            # Handle both single objects and arrays of objects
+            if isinstance(parsed, list):
+                # Convert array of objects to YAML with document separators
+                yaml_parts = []
+                for item in parsed:
+                    yaml_parts.append(yaml.dump(item, default_flow_style=False, sort_keys=False))
+                content = "---\n".join(yaml_parts)
+                logging.debug(f"Converted ToolMessage array content to YAML format ({len(parsed)} items)")
+            elif isinstance(parsed, dict):
+                # Convert single object to YAML
+                content = yaml.dump(parsed, default_flow_style=False, sort_keys=False)
+                logging.debug(f"Converted ToolMessage dict content to YAML format")
+        except (json.JSONDecodeError, TypeError):
+            # If not valid JSON, use original content
+            pass
+        
+        return f"\n[MCP result payloads]: {content}"
+
+    def _extract_mcp_responses(self, state: AgentState) -> str:
+        """
+        Extracts MCP response resources from all messages in state.
+        
+        Args:
+            state: The current agent state
+            
+        Returns:
+            Formatted MCP response resources string, or empty string if none found
+        """
+        mcp_response = ''
+        for msg in reversed(state["messages"]):
+            additional_kwargs = msg.additional_kwargs if hasattr(msg, "additional_kwargs") else {}
+            
+            # Include MCP response data if present (from tool execution)
+            if "mcp_response" in additional_kwargs:
+                mcp_response += f"\n{additional_kwargs['mcp_response'].strip('<mcp-response></mcp-response>')}"
+                
+        if mcp_response:
+            mcp_response = '\n[MCP result resources]: ' + mcp_response
+            
+        return mcp_response
+
+    def _dispatch_ui_tools_event(self, state: AgentState, config: RunnableConfig) -> list[dict]:
+        """
+        Helper method to dispatch UI tools event.
+        
+        Selects and dispatches UI tools based on the current state.
+        This can be called from various nodes, including when a confirmation-response
+        is being sent, to ensure UI tools are available to the client.
+        
+        Args:
+            state: The current agent state
+            config: The runtime configuration containing ui_tools_config
+            
+        Returns:
+            List of selected UI tools, or empty list if dispatch was skipped
+        """
+        try:
+            # Extract the UI tools configuration from request metadata
+            request_metadata = config.get("configurable", {}).get("request_metadata", {})
+            ui_tools_config = request_metadata.get("ui_tools", {})
+            
+            logging.debug(f"_dispatch_ui_tools_event: config={ui_tools_config}")
+            
+            name = ui_tools_config.get("name", "")
+            tool_filters = ui_tools_config.get("tools", [])
+
+            if not name:
+                logging.debug("UI tools config name is missing, skipping ui tools dispatch")
+                return []
+            
+            if not tool_filters or len(tool_filters) == 0:
+                logging.debug("UI tools list is empty, skipping ui tools dispatch")
+                return []
+            
+            ui_tools_config_data = load_ui_tools_from_configmap(name)
+            
+            if not ui_tools_config_data or not ui_tools_config_data.config:
+                logging.debug(f"UI tools config {name} not found, skipping ui tools dispatch")
+                return []
+            
+            if not ui_tools_config_data.config.enabled:
+                logging.debug(f"UI tools config {name} are disabled, skipping ui tools dispatch")
+                return []
+
+            # Filter tools: keep only enabled tools that are in the tool_filters list
+            filtered_tools = []
+            for tool in ui_tools_config_data.tools:
+                if filter_tool(tool, tool_filters):
+                    filtered_tools.append(tool)
+            logging.debug(f"Filtered UI tools: {[t.name for t in filtered_tools]} based on filters: {tool_filters}")
+
+            # Skip if filtered tools list is empty
+            if len(filtered_tools) == 0:
+                logging.debug("No UI tools available after filtering, skipping ui tools dispatch")
+                return []
+            
+            # Get the selected agent context
+            selected_agent = state.get("selected_agent", {}).get("name", "")
+            agent_config = None
+            for child in self.child_agents:
+                if child.config.name == selected_agent:
+                    agent_config = child.config
+                    break
+
+            # Extract context for tool selection
+            user_message, ai_message, mcp_response, mcp_data = self._extract_context_for_tool_selection(state, config)
+
+            # Get the system prompt and max_tools from the config
+            system_prompt = ui_tools_config_data.config.system_prompt
+            max_tools = ui_tools_config_data.config.max_tools
+            
+            # Create a UI tools selector using the same LLM and the system prompt
+            selector = create_ui_tools_selector(self.llm, system_prompt=system_prompt, max_tools=max_tools)
+            
+            # Dispatch processing message to notify the ui-tools selection is in progress
+            # This should become a standard pattern, potentially implemented as a LangGraph event, to notify the UI the status of operations
+            dispatch_custom_event("notify_processing", "<processing-ui-tools/>")
+            
+            # select_tools already returns sanitized and validated ui tools
+            ui_tools_list = selector.select_tools(
+                agent_config=agent_config,
+                context=user_message + ai_message,
+                mcp_response=mcp_response + mcp_data,
+                available_tools=filtered_tools,
+            )
+            
+            # Dispatch custom event with all tools
+            self._dispatch_ui_tools(ui_tools_list)
+            
+            return ui_tools_list
+        except Exception as e:
+            logging.error(f"Error dispatching UI tools event: {e}", exc_info=True)
+            return []
+            
+    def _dispatch_preprocessed_ui_tools(self, state: AgentState, config: RunnableConfig, tools: list[dict]) -> None:
+        """
+        Helper method to dispatch preprocessed UI tools.
+
+        This method can be used to dispatch UI tools that have been preprocessed,
+        for example based on the MCP response or other intermediate computations.
+        It ensures the tools are sent to the UI in a consistent format.
+
+        Args:
+            state: The current state of the agent, containing the full conversation.
+            config: The runtime configuration containing ui_tools_config name.
+            tools: A list of dictionaries representing the preprocessed UI tools to dispatch.
+        """
+        # Extract the UI tools configuration from request metadata
+        request_metadata = config.get("configurable", {}).get("request_metadata", {})
+        ui_tools_config = request_metadata.get("ui_tools", {})
+        
+        logging.debug(f"_dispatch_preprocessed_ui_tools: config={ui_tools_config}")
+        
+        name = ui_tools_config.get("name", "")
+
+        if not name:
+            logging.debug("UI tools config name is missing, skipping ui tools dispatch")
+            return
+        
+        self._dispatch_ui_tools(tools)
+
+    def _dispatch_ui_tools(self, tools: list[dict]) -> None:
+        """
+        Helper method to dispatch UI tools event with a given list of tools.
+        
+        Args:
+            tools: A list of dictionaries representing the selected UI tools to dispatch.
+        """
+        try:
+            ui_tools_json = json.dumps(tools)
+            ui_tools_event = f"<ui-tools>{ui_tools_json}</ui-tools>"
+            dispatch_custom_event("ui_tools", ui_tools_event)
+            logging.debug(f"Dispatched {len(tools)} UI tool(s): {[t['toolName'] for t in tools]}")
+        except Exception as e:
+            logging.error(f"Error dispatching UI tools: {e}", exc_info=True)
+
+    def ui_tools_node(self, state: AgentState, config: RunnableConfig):
+        """
+        Select appropriate UI tools for the agent's response.
+        
+        This node is the deterministic step that ALL execution paths converge to
+        before ending or summarizing. Therefore, it runs exactly once per request.
+        
+        When UI tools are disabled or the filtered tools list is empty, this node
+        returns early without executing the selector and without dispatching the 
+        ui-tools event to the UI.
+        
+        Args:
+            state: The current state of the agent, containing the full conversation.
+            config: The runtime configuration containing ui_tools_config name.
+        
+        Returns:
+            A dictionary with the updated AIMessage containing ui_tools in additional_kwargs (empty if skipped).
+        """
+        # Dispatch UI tools using the helper method
+        ui_tools_list = self._dispatch_ui_tools_event(state, config)
+        
+        # Save UI tools to the AIMessage's additional_kwargs for this request_id
+        if ui_tools_list:
+            request_id = config["configurable"]["request_id"]
+            
+            # Find the AIMessage with matching request_id
+            for msg in reversed(state["messages"]):
+                if isinstance(msg, AIMessage):
+                    additional_kwargs = msg.additional_kwargs if hasattr(msg, "additional_kwargs") else {}
+                    if additional_kwargs.get("request_id") == request_id:
+                        # Add ui_tools to the AIMessage's additional_kwargs
+                        additional_kwargs["ui_tools"] = ui_tools_list
+                        msg.additional_kwargs = additional_kwargs
+                        return {"messages": [msg]}
+            
+            logging.warning(f"Could not find AIMessage with request_id {request_id} to attach ui_tools")
+        
+        return {"messages": []}
 
     def _count_consecutive_tool_rounds(self, state: AgentState) -> int:
         """Count the number of consecutive tool call rounds since the last HumanMessage.
@@ -244,7 +527,7 @@ You are a highly specialized Assistant. Your primary goal is to provide accurate
         # responses first ensures every tool is executed exactly once.
         interrupt_messages = {}
         for idx, tool_call in enumerate(tool_calls):
-            should_continue, interrupt_message = await self.handle_interrupt(human_validation_tools, tool_call, state)
+            should_continue, interrupt_message, ui_tools_list = await self.handle_interrupt(human_validation_tools, tool_call, state, config)
             if not should_continue:
                 # Cancel ALL tool calls: previously approved ones, the rejected one,
                 # and any remaining unevaluated ones — no tools will be executed.
@@ -253,6 +536,7 @@ You are a highly specialized Assistant. Your primary goal is to provide accurate
                     "request_id": request_id,
                     "selected_agent": state.get("selected_agent", {}),
                     "interrupt_message": interrupt_message,
+                    "ui_tools": ui_tools_list,
                     "confirmation": False
                 }
                 outputs.append(ToolMessage(
@@ -264,7 +548,10 @@ You are a highly specialized Assistant. Your primary goal is to provide accurate
                 outputs.extend(self._cancel_remaining_tool_calls(tool_calls[idx + 1:], request_id, state, INTERRUPT_CANCEL_MESSAGE))
                 return {"messages": outputs}
             if interrupt_message:
-                interrupt_messages[tool_call["id"]] = interrupt_message
+                interrupt_messages[tool_call["id"]] = {
+                    "message": interrupt_message,
+                    "ui_tools": ui_tools_list
+                }
 
         # Phase 2: Execute tools (all interrupts were approved if we reach here).
         for idx, tool_call in enumerate(tool_calls):
@@ -275,8 +562,9 @@ You are a highly specialized Assistant. Your primary goal is to provide accurate
 
             interrupt_message = interrupt_messages.get(tool_call["id"])
             if interrupt_message:
-                additional_kwargs["interrupt_message"] = interrupt_message
+                additional_kwargs["interrupt_message"] = interrupt_message["message"]
                 additional_kwargs["confirmation"] = True
+                additional_kwargs["ui_tools"] = interrupt_message["ui_tools"]
             
             try:
                 logging.debug("calling tool")
@@ -419,18 +707,66 @@ You are a highly specialized Assistant. Your primary goal is to provide accurate
 
         return ""
 
-    async def handle_interrupt(self, human_validation_tools: list[str], tool_call: dict, state: AgentState) -> tuple[bool, str | None]:
+    async def handle_interrupt(self, human_validation_tools: list[str], tool_call: dict, state: AgentState, config: RunnableConfig = None) -> tuple[bool, str | None, list[dict]]:
         """Handles the user confirmation interrupt for a tool call.
         
+        Args:
+            human_validation_tools: List of tool names that require human validation
+            tool_call: The tool call dictionary
+            state: The current agent state
+            config: The runtime configuration (optional, needed to dispatch UI tools)
+        
         Returns:
-            A tuple of (should_continue, interrupt_message) where:
+            A tuple of (should_continue, interrupt_message, ui_tools_list) where:
             - should_continue: True if execution should continue, False if cancelled
             - interrupt_message: The interrupt message if one was triggered, None otherwise
+            - ui_tools_list: List of UI tools for this confirmation, empty if none
         """
+        ui_tools_list = []
+        
         if interrupt_message := await self.should_interrupt(human_validation_tools, tool_call):
+            logging.info(f"Confirmation interrupt triggered for tool '{tool_call.get('name')}', config={'present' if config else 'missing'}")
+            
+            if interrupt_message:
+                # Dispatch UI tools before the interrupt, so they're available to the client
+                if config is not None:
+                    try:
+                        data = json.loads(interrupt_message.strip('<confirmation-response></confirmation-response>'))
+                        if isinstance(data, list) and len(data) > 0:
+                            data = data[0]
+                            
+                        # Build ui tool
+                        resource = data.get("resource", {})
+                        input = {
+                            "resourceKind": resource.get("kind"),
+                            "resourceName": resource.get("name"),
+                            "resourceNamespace": resource.get("namespace"),
+                        }
+                        ui_tool_name = "show-yaml"
+
+                        if data.get("type") == "create":
+                            input["yaml"] = data.get("payload", {})
+                        else:
+                            ui_tool_name = "show-yaml-diff"
+                            input["original"] = data.get("payload", {}).get("original")
+                            input["patched"] = data.get("payload", {}).get("patched")
+
+                        input = {k: v for k, v in input.items() if v is not None}
+                        
+                        ui_tools_list = [{
+                            "toolName": ui_tool_name,
+                            "input": input,
+                        }]
+                        self._dispatch_preprocessed_ui_tools(state, config, ui_tools_list)
+                    except Exception as e:
+                        logging.debug(f"Could not extract precomputed fields from interrupt message and dispatch UI tools: {e}")
+
+                else:
+                    logging.warning("config is None, cannot dispatch UI tools before confirmation")
+            
             response = langgraph.types.interrupt(interrupt_message)
             if response != "yes":
-                return False, interrupt_message
+                return False, interrupt_message, ui_tools_list
             
             selected_agent = state.get("selected_agent", {})
             if selected_agent:
@@ -438,9 +774,9 @@ You are a highly specialized Assistant. Your primary goal is to provide accurate
                     "subagent_choice_event",
                     build_agent_metadata(selected_agent.get("name"), selected_agent.get("mode")),
                 )
-            return True, interrupt_message
+            return True, interrupt_message, ui_tools_list
             
-        return True, None 
+        return True, None, ui_tools_list 
 
 
 
@@ -467,7 +803,7 @@ def process_tool_result(tool_result: str | list, state: AgentState) -> tuple[str
 
         if "uiContext" in json_result:
             mcp_response = f"<mcp-response>{json.dumps(json_result['uiContext'])}</mcp-response>"
-            dispatch_custom_event("ui_context",mcp_response)
+            dispatch_custom_event("ui_context", mcp_response)
         if "docLinks" in json_result:
             for link in json_result['docLinks']:
                 dispatch_custom_event(
