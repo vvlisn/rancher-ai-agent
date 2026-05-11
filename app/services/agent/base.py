@@ -24,6 +24,11 @@ INTERRUPT_CANCEL_MESSAGE = "tool execution cancelled by the user"
 INTERRUPT_PREVIOUS_TOOL_FAILED_MESSAGE = "tool execution cancelled because previous tool call failed"
 MAX_CONSECUTIVE_TOOL_CALLS = 5
 
+
+class InterruptToolException(Exception):
+    """Exception raised when invoking a tool that should trigger an interrupt."""
+    pass
+
 class BaseAgentBuilder:
     """Base class for agent builders with shared logic."""
     
@@ -527,7 +532,19 @@ You are a highly specialized Assistant. Your primary goal is to provide accurate
         # responses first ensures every tool is executed exactly once.
         interrupt_messages = {}
         for idx, tool_call in enumerate(tool_calls):
-            should_continue, interrupt_message, ui_tools_list = await self.handle_interrupt(human_validation_tools, tool_call, state, config)
+            should_continue, interrupt_message, ui_tools_list = None, None, []
+            
+            try:
+                should_continue, interrupt_message, ui_tools_list = await self.handle_interrupt(human_validation_tools, tool_call, state, config)
+            except InterruptToolException as e:
+                logging.error(f"Error during confirmation interrupt: {e}")
+                interrupt_messages[tool_call["id"]] = {
+                    "message": f"{e}",
+                    "ui_tools": [],
+                    "interrupt-error": True
+                }
+                break
+
             if not should_continue:
                 # Cancel ALL tool calls: previously approved ones, the rejected one,
                 # and any remaining unevaluated ones — no tools will be executed.
@@ -553,7 +570,7 @@ You are a highly specialized Assistant. Your primary goal is to provide accurate
                     "ui_tools": ui_tools_list
                 }
 
-        # Phase 2: Execute tools (all interrupts were approved if we reach here).
+        # Phase 2: Execute tools (all interrupts were approved OR interrupt errors occurred if we reach here).
         for idx, tool_call in enumerate(tool_calls):
             additional_kwargs = {
                 "request_id": request_id,
@@ -567,6 +584,10 @@ You are a highly specialized Assistant. Your primary goal is to provide accurate
                 additional_kwargs["ui_tools"] = interrupt_message["ui_tools"]
             
             try:
+                # Skip execution and return the exception as information for the next nodes to handle
+                if interrupt_message and interrupt_message.get("interrupt-error", False):
+                    raise ToolException(interrupt_message['message'])
+
                 logging.debug("calling tool")
                 tool_result = await self.tools_by_name[tool_call["name"]].ainvoke(tool_call["args"])
                 logging.debug("tool call finished")
@@ -692,7 +713,11 @@ You are a highly specialized Assistant. Your primary goal is to provide accurate
                 plan_tool = self.planning_tools_by_name.get(plan_tool_name)
                 if plan_tool is None:
                     raise ValueError(f"planning tool '{plan_tool_name}' not found for tool '{tool_call['name']}'")
-                plan_response = await plan_tool.ainvoke(tool_call["args"])
+                try:
+                    plan_response = await plan_tool.ainvoke(tool_call["args"])
+                except Exception as e:
+                    logging.error(f"error invoking planning tool '{plan_tool_name}' for interrupt: {e}")
+                    raise InterruptToolException(e)
 
                 # Normalize list response from MCP tools: [{"type": "text", "text": "..."}]
                 if isinstance(plan_response, list) and len(plan_response) > 0:
@@ -703,7 +728,8 @@ You are a highly specialized Assistant. Your primary goal is to provide accurate
                     safe_response = json.dumps(json.loads(plan_response))
                 except (json.JSONDecodeError, TypeError):
                     safe_response = json.dumps(plan_response)
-                return f'<confirmation-response>{safe_response}</confirmation-response>'
+
+                return safe_response
 
         return ""
 
@@ -722,51 +748,60 @@ You are a highly specialized Assistant. Your primary goal is to provide accurate
             - interrupt_message: The interrupt message if one was triggered, None otherwise
             - ui_tools_list: List of UI tools for this confirmation, empty if none
         """
-        ui_tools_list = []
-        
-        if interrupt_message := await self.should_interrupt(human_validation_tools, tool_call):
+        interrupt_message = None
+
+        try:
+            interrupt_message = await self.should_interrupt(human_validation_tools, tool_call)
+        except InterruptToolException as e:
+            logging.error(f"Error during interrupt message generation: {e}")
+            raise e
+
+        if interrupt_message:
             logging.info(f"Confirmation interrupt triggered for tool '{tool_call.get('name')}', config={'present' if config else 'missing'}")
             
-            if interrupt_message:
-                # Dispatch UI tools before the interrupt, so they're available to the client
-                if config is not None:
-                    try:
-                        data = json.loads(interrupt_message.strip('<confirmation-response></confirmation-response>'))
-                        if isinstance(data, list) and len(data) > 0:
-                            data = data[0]
-                            
-                        # Build ui tool
-                        resource = data.get("resource", {})
-                        input = {
-                            "resourceKind": resource.get("kind"),
-                            "resourceName": resource.get("name"),
-                            "resourceNamespace": resource.get("namespace"),
-                        }
-                        ui_tool_name = "show-yaml"
-
-                        if data.get("type") == "create":
-                            input["yaml"] = data.get("payload", {})
-                        else:
-                            ui_tool_name = "show-yaml-diff"
-                            input["original"] = data.get("payload", {}).get("original")
-                            input["patched"] = data.get("payload", {}).get("patched")
-
-                        input = {k: v for k, v in input.items() if v is not None}
-                        
-                        ui_tools_list = [{
-                            "toolName": ui_tool_name,
-                            "input": input,
-                        }]
-                        self._dispatch_preprocessed_ui_tools(state, config, ui_tools_list)
-                    except Exception as e:
-                        logging.debug(f"Could not extract precomputed fields from interrupt message and dispatch UI tools: {e}")
-
-                else:
-                    logging.warning("config is None, cannot dispatch UI tools before confirmation")
+            ui_tools_list = []
             
-            response = langgraph.types.interrupt(interrupt_message)
+            # Dispatch UI tools before the interrupt, so they're available to the client
+            if config is not None:
+                try:
+                    data = json.loads(interrupt_message)
+                    if isinstance(data, list) and len(data) > 0:
+                        data = data[0]
+                        
+                    # Build ui tool
+                    resource = data.get("resource", {})
+                    input = {
+                        "resourceKind": resource.get("kind"),
+                        "resourceName": resource.get("name"),
+                        "resourceNamespace": resource.get("namespace"),
+                    }
+                    ui_tool_name = "show-yaml"
+
+                    if data.get("type") == "create":
+                        input["yaml"] = data.get("payload", {})
+                    else:
+                        ui_tool_name = "show-yaml-diff"
+                        input["original"] = data.get("payload", {}).get("original")
+                        input["patched"] = data.get("payload", {}).get("patched")
+
+                    input = {k: v for k, v in input.items() if v is not None}
+                    
+                    ui_tools_list = [{
+                        "toolName": ui_tool_name,
+                        "input": input,
+                    }]
+                    self._dispatch_preprocessed_ui_tools(state, config, ui_tools_list)
+                except Exception as e:
+                    logging.debug(f"Could not extract precomputed fields from interrupt message and dispatch UI tools: {e}")
+
+            else:
+                logging.warning("config is None, cannot dispatch UI tools before confirmation")
+            
+            interrupt_message_result = build_interrupt_message_result(interrupt_message)
+
+            response = langgraph.types.interrupt(interrupt_message_result)
             if response != "yes":
-                return False, interrupt_message, ui_tools_list
+                return False, interrupt_message_result, ui_tools_list
             
             selected_agent = state.get("selected_agent", {})
             if selected_agent:
@@ -774,9 +809,9 @@ You are a highly specialized Assistant. Your primary goal is to provide accurate
                     "subagent_choice_event",
                     build_agent_metadata(selected_agent.get("name"), selected_agent.get("mode")),
                 )
-            return True, interrupt_message, ui_tools_list
+            return True, interrupt_message_result, ui_tools_list
             
-        return True, None, ui_tools_list 
+        return True, None, []
 
 
 
@@ -816,6 +851,10 @@ def process_tool_result(tool_result: str | list, state: AgentState) -> tuple[str
     except (json.JSONDecodeError, TypeError):
         # If it's not a valid JSON, return the raw string result
         return tool_result, mcp_response
+    
+def build_interrupt_message_result(interrupt_message) -> str:
+    """Builds the interrupt message content based on the tool call and its planning response."""
+    return f"<confirmation-response>{interrupt_message}</confirmation-response>"
 
 
 def convert_to_string_if_needed(var):
