@@ -4,7 +4,7 @@ Tests tool filtering, conversion to LangChain tools, selector initialization,
 prompt building, tool selection, and sanitization.
 """
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from app.services.ui_tools.selector import UIToolsSelector
 from app.services.ui_tools.models import (
@@ -353,9 +353,8 @@ class TestUIToolsSelectorPromptBuilding:
         selector = UIToolsSelector(mock_llm, "", max_tools=5)
         
         context = "Showing pod nginx-pod"
-        text_prompt = selector._build_text_prompt(agent_config, context, None)
+        text_prompt = selector._build_text_prompt(context, None)
         
-        assert "Test Agent" in text_prompt
         assert "Showing pod nginx-pod" in text_prompt
         assert "CONTEXT:" in text_prompt
     
@@ -366,7 +365,7 @@ class TestUIToolsSelectorPromptBuilding:
         
         context = "Got resources"
         mcp_response = "MCP Response data"
-        text_prompt = selector._build_text_prompt(agent_config, context, mcp_response)
+        text_prompt = selector._build_text_prompt(context, mcp_response)
         
         assert "MCP RESPONSE:" in text_prompt
         assert "MCP Response data" in text_prompt
@@ -376,7 +375,8 @@ class TestUIToolsSelectorToolSelection:
     """Test tool selection in UIToolsSelector."""
     
     @patch('app.services.ui_tools.selector.create_ui_tools_validator')
-    def test_select_tools_success(
+    @pytest.mark.asyncio
+    async def test_select_tools_success(
         self, mock_validator, mock_llm, agent_config, sample_ui_tool
     ):
         """Test successful tool selection."""
@@ -388,7 +388,7 @@ class TestUIToolsSelectorToolSelection:
         response.tool_calls = [
             {"name": "show-yaml", "args": {"name": "my-pod", "namespace": "default"}}
         ]
-        mock_llm.invoke.return_value = response
+        mock_llm.bind_tools.return_value.ainvoke = AsyncMock(return_value=response)
         
         # Mock validator
         mock_validator_instance = MagicMock()
@@ -397,35 +397,38 @@ class TestUIToolsSelectorToolSelection:
         ]
         mock_validator.return_value = mock_validator_instance
         
-        result = selector.select_tools(agent_config, "test context", None, [sample_ui_tool])
+        result = await selector.select_tools("test context", None, available_tools=[sample_ui_tool])
         
         assert len(result) == 1
         assert result[0]["toolName"] == "show-yaml"
     
     @patch('app.services.ui_tools.selector.create_ui_tools_validator')
-    def test_select_tools_no_available_tools(self, mock_validator, mock_llm, agent_config):
+    @pytest.mark.asyncio
+    async def test_select_tools_no_available_tools(self, mock_validator, mock_llm, agent_config):
         """Test tool selection with no available tools."""
         from app.services.ui_tools.selector import UIToolsSelector
         selector = UIToolsSelector(mock_llm, "", max_tools=5)
         
-        result = selector.select_tools(agent_config, "test context", None, [])
+        result = await selector.select_tools("test context", None, available_tools=[])
         
         assert result == []
     
     @patch('app.services.ui_tools.selector.create_ui_tools_validator')
-    def test_select_tools_error_handling(self, mock_validator, mock_llm, agent_config, sample_ui_tool):
+    @pytest.mark.asyncio
+    async def test_select_tools_error_handling(self, mock_validator, mock_llm, agent_config, sample_ui_tool):
         """Test error handling in tool selection."""
         from app.services.ui_tools.selector import UIToolsSelector
         selector = UIToolsSelector(mock_llm, "", max_tools=5)
         
-        mock_llm.invoke.side_effect = Exception("LLM error")
+        mock_llm.bind_tools.return_value.ainvoke = AsyncMock(side_effect=Exception("LLM error"))
         
-        result = selector.select_tools(agent_config, "test context", None, [sample_ui_tool])
+        result = await selector.select_tools("test context", None, available_tools=[sample_ui_tool])
         
         assert result == []
     
     @patch('app.services.ui_tools.selector.create_ui_tools_validator')
-    def test_select_tools_no_tool_calls_in_response(
+    @pytest.mark.asyncio
+    async def test_select_tools_no_tool_calls_in_response(
         self, mock_validator, mock_llm, agent_config, sample_ui_tool
     ):
         """Test when LLM response has no tool calls."""
@@ -434,13 +437,13 @@ class TestUIToolsSelectorToolSelection:
         
         response = MagicMock()
         response.tool_calls = []
-        mock_llm.invoke.return_value = response
+        mock_llm.bind_tools.return_value.ainvoke = AsyncMock(return_value=response)
         
         mock_validator_instance = MagicMock()
         mock_validator_instance.validate_tool_calls.return_value = []
         mock_validator.return_value = mock_validator_instance
         
-        result = selector.select_tools(agent_config, "test context", None, [sample_ui_tool])
+        result = await selector.select_tools("test context", None, available_tools=[sample_ui_tool])
         
         assert result == []
 
@@ -661,7 +664,8 @@ class TestUIToolsSelectorIntegration:
     """Integration tests for UIToolsSelector."""
     
     @patch('app.services.ui_tools.selector.create_ui_tools_validator')
-    def test_full_workflow_single_tool_selection(
+    @pytest.mark.asyncio
+    async def test_full_workflow_single_tool_selection(
         self, mock_validator, mock_llm, agent_config, sample_ui_tool
     ):
         """Test full workflow of tool selection."""
@@ -673,7 +677,7 @@ class TestUIToolsSelectorIntegration:
         response.tool_calls = [
             {"name": "show-yaml", "args": {"name": "nginx-pod", "namespace": "default"}}
         ]
-        mock_llm.invoke.return_value = response
+        mock_llm.bind_tools.return_value.ainvoke = AsyncMock(return_value=response)
         
         # Mock validator
         mock_validator_instance = MagicMock()
@@ -682,11 +686,10 @@ class TestUIToolsSelectorIntegration:
         ]
         mock_validator.return_value = mock_validator_instance
         
-        result = selector.select_tools(
-            agent_config,
+        result = await selector.select_tools(
             "Deploy nginx pod to default namespace",
             None,
-            [sample_ui_tool]
+            available_tools=[sample_ui_tool]
         )
         
         assert len(result) == 1
@@ -694,7 +697,8 @@ class TestUIToolsSelectorIntegration:
         assert result[0]["input"]["name"] == "nginx-pod"
     
     @patch('app.services.ui_tools.selector.create_ui_tools_validator')
-    def test_workflow_with_mcp_response(
+    @pytest.mark.asyncio
+    async def test_workflow_with_mcp_response(
         self, mock_validator, mock_llm, agent_config, sample_ui_tool
     ):
         """Test workflow with MCP response context."""
@@ -713,7 +717,7 @@ class TestUIToolsSelectorIntegration:
         response.tool_calls = [
             {"name": "show-yaml", "args": {"name": "nginx-pod"}}
         ]
-        mock_llm.invoke.return_value = response
+        mock_llm.bind_tools.return_value.ainvoke = AsyncMock(return_value=response)
         
         mock_validator_instance = MagicMock()
         mock_validator_instance.validate_tool_calls.return_value = [
@@ -721,13 +725,12 @@ class TestUIToolsSelectorIntegration:
         ]
         mock_validator.return_value = mock_validator_instance
         
-        result = selector.select_tools(
-            agent_config,
+        result = await selector.select_tools(
             "Show yaml for nginx pod",
             mcp_response,
-            [sample_ui_tool]
+            available_tools=[sample_ui_tool]
         )
         
         assert len(result) == 1
         # Verify LLM was called (with mcp_response included)
-        mock_llm.invoke.assert_called_once()
+        mock_llm.bind_tools.return_value.ainvoke.assert_called_once()

@@ -1,24 +1,22 @@
 """
-Unit tests for the ChildAgentBuilder class.
+Unit tests for the child agent module (app.services.agent.child).
 
-Tests the creation and behavior of child agents that delegate summarization
-to their parent agents.
+Tests: create_child_agent factory, middleware registration, tool filtering.
 """
 import pytest
-from unittest.mock import MagicMock
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
-from langgraph.graph import END
-from langgraph.checkpoint.memory import InMemorySaver
-from app.services.agent.base import BaseAgentBuilder
-from app.services.agent.child import ChildAgentBuilder, create_child_agent
-from app.services.agent.loader import AgentConfig, AuthenticationType
+from unittest.mock import MagicMock, patch
+from langchain_core.tools import tool as langchain_tool
+
+from app.services.agent.child import create_child_agent
 
 
-class MockTool:
-    """Mock tool for testing."""
-    def __init__(self, name, return_value="mock_result"):
-        self.name = name
-        self._return_value = return_value
+def _make_langchain_tool(name: str):
+    """Create a real langchain tool for tests that require it."""
+    @langchain_tool(name)
+    def _tool(x: str = "") -> str:
+        """A test tool."""
+        return "result"
+    return _tool
 
 
 @pytest.fixture
@@ -26,99 +24,105 @@ def mock_llm():
     """Mock LLM with bound tools."""
     llm = MagicMock()
     llm.bind_tools = MagicMock(return_value=llm)
-    llm.invoke = MagicMock(return_value=AIMessage(content="child_agent_response"))
     return llm
-
-
-@pytest.fixture
-def mock_tools():
-    """Mock tools for testing."""
-    return [
-        MockTool("getKubernetesResource"),
-        MockTool("patchKubernetesResource")
-    ]
 
 
 @pytest.fixture
 def mock_checkpointer():
     """Mock checkpointer for state persistence."""
-    return InMemorySaver()
+    return False
 
 
 @pytest.fixture
 def agent_config():
-    """Mock agent configuration."""
-    return AgentConfig(
-        name="test-child-agent",
-        displayName="Test Child Agent",
-        description="Test child agent",
-        system_prompt="You are a test child agent",
-        mcp_url="http://test:8080",
-        authentication=AuthenticationType.NONE,
-        human_validation_tools=["patchKubernetesResource"]
-    )
+    """Minimal AgentConfig mock."""
+    config = MagicMock()
+    config.human_validation_tools = []
+    return config
 
 
 # ============================================================================
-# Builder Initialization Tests
+# create_child_agent Tests
 # ============================================================================
 
-def test_child_agent_builder_initialization(mock_llm, mock_tools, mock_checkpointer, agent_config):
-    """Verify that ChildAgentBuilder correctly initializes with all required parameters."""
-    builder = ChildAgentBuilder(
+
+@patch("app.services.agent.child.create_agent")
+def test_create_child_agent_excludes_plan_tools_from_execution(mock_create_agent, mock_llm, mock_checkpointer, agent_config):
+    """Verify Plan tools are excluded from the execution tool list."""
+    mock_create_agent.return_value = MagicMock()
+
+    tools = [
+        _make_langchain_tool("createPod"),
+        _make_langchain_tool("createPodPlan"),
+        _make_langchain_tool("listPods"),
+    ]
+
+    create_child_agent(
         llm=mock_llm,
-        tools=mock_tools,
-        system_prompt="test system prompt",
+        tools=tools,
+        system_prompt="test",
         checkpointer=mock_checkpointer,
-        agent_config=agent_config
+        agent_config=agent_config,
     )
 
-    assert builder is not None
-    assert builder.llm == mock_llm
-    assert builder.tools == mock_tools
-    assert builder.system_prompt == "test system prompt"
-    assert builder.checkpointer == mock_checkpointer
-    assert builder.agent_config == agent_config
-    assert isinstance(builder, BaseAgentBuilder)
-    mock_llm.bind_tools.assert_called_once_with(mock_tools)
+    call_kwargs = mock_create_agent.call_args[1]
+    execution_tools = call_kwargs["tools"]
+    tool_names = [t.name for t in execution_tools]
+
+    assert "createPod" in tool_names
+    assert "listPods" in tool_names
+    assert "createPodPlan" not in tool_names
 
 
+@patch("app.services.agent.child.create_agent")
+def test_create_child_agent_registers_expected_middleware(mock_create_agent, mock_llm, mock_checkpointer, agent_config):
+    """Verify the child agent registers the expected middleware stack."""
+    from app.services.agent.middleware import MessagesHistoryMiddleware
+    from langchain.agents.middleware import SummarizationMiddleware
 
-# ============================================================================
-# Graph Building Tests
-# ============================================================================
+    mock_create_agent.return_value = MagicMock()
 
-def test_child_agent_build_returns_compiled_graph(mock_llm, mock_tools, mock_checkpointer, agent_config):
-    """Verify that build() returns a compiled StateGraph."""
-    builder = ChildAgentBuilder(
+    tools = [_make_langchain_tool("testTool")]
+
+    create_child_agent(
         llm=mock_llm,
-        tools=mock_tools,
-        system_prompt="test system prompt",
+        tools=tools,
+        system_prompt="test",
         checkpointer=mock_checkpointer,
-        agent_config=agent_config
+        agent_config=agent_config,
     )
 
-    graph = builder.build()
+    call_kwargs = mock_create_agent.call_args[1]
+    middleware = call_kwargs["middleware"]
 
-    assert graph is not None
-    # Check that it's a compiled graph
-    assert hasattr(graph, 'invoke')
-    assert hasattr(graph, 'stream')
+    middleware_types = [type(m).__name__ for m in middleware]
+    assert "MessagesHistoryMiddleware" in middleware_types
+    assert "SummarizationMiddleware" in middleware_types
+
+    # 7 middleware total: MessagesHistory, human_validation, identity_preamble,
+    # cancel_check, inject_kwargs, ui_tools, Summarization
+    assert len(middleware) == 7
 
 
-def test_child_agent_graph_has_correct_nodes(mock_llm, mock_tools, mock_checkpointer, agent_config):
-    """Verify that the child agent graph contains the expected nodes."""
-    builder = ChildAgentBuilder(
+@patch("app.services.agent.child.create_agent")
+def test_create_child_agent_appends_tool_use_instructions_to_prompt(mock_create_agent, mock_llm, mock_checkpointer, agent_config):
+    """Verify CHILD_TOOL_USE_INSTRUCTIONS is appended to the system prompt."""
+    from app.services.agent.child import CHILD_TOOL_USE_INSTRUCTIONS
+
+    mock_create_agent.return_value = MagicMock()
+
+    tools = [_make_langchain_tool("testTool")]
+
+    create_child_agent(
         llm=mock_llm,
-        tools=mock_tools,
-        system_prompt="test system prompt",
+        tools=tools,
+        system_prompt="Base prompt.",
         checkpointer=mock_checkpointer,
-        agent_config=agent_config
+        agent_config=agent_config,
     )
 
-    graph = builder.build()
+    call_kwargs = mock_create_agent.call_args[1]
+    system_prompt = call_kwargs["system_prompt"]
 
-    # Access the underlying graph structure
-    nodes = graph.nodes
-    assert "agent" in nodes
-    assert "tools" in nodes
+    assert system_prompt.startswith("Base prompt.")
+    assert CHILD_TOOL_USE_INSTRUCTIONS in system_prompt

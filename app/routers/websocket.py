@@ -2,9 +2,11 @@ import os
 import uuid
 import logging
 import json
+from datetime import datetime
 
 from ..dependencies import get_llm
-from ..services.agent.factory import NoAgentAvailableError, create_agent
+from ..services.agent.factory import NoAgentAvailableError, build_agent
+from ..services.agent.supervisor import SupervisorGraph
 from dataclasses import dataclass
 from fastapi import APIRouter
 from fastapi import  WebSocket, WebSocketDisconnect, Depends
@@ -16,7 +18,7 @@ from langchain_core.messages import HumanMessage
 from langgraph.types import Command
 
 from ..services.auth import get_user_id
-from ..dependencies import get_llm
+from ..constants import CONTEXT_PARAMETERS_SUFFIX
 
 router = APIRouter()
 
@@ -25,7 +27,7 @@ async def get_user_id_from_websocket(websocket: WebSocket) -> str:
     Retrieves the user ID from the Rancher API using the session token from the WebSocket cookies.
     """
     cookies = websocket.cookies
-    rancher_url = os.environ.get("RANCHER_URL","https://"+websocket.url.hostname)
+    rancher_url = os.environ.get("RANCHER_URL","https://rancher.cattle-system.svc")
     token = os.environ.get("RANCHER_API_TOKEN", cookies.get("R_SESS", ""))
 
     return await get_user_id(rancher_url, token)
@@ -75,12 +77,18 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str = None, llm: B
     logging.debug("ws/messages connection opened")
     
     try:
-        agent, agents_metadata =  await create_agent(llm=llm, websocket=websocket) 
+        agent, agents_metadata =  await build_agent(llm=llm, websocket=websocket) 
     except NoAgentAvailableError as e:
         logging.error(f"Error creating agent: {e}")
         await websocket.send_text(f'<chat-error>{json.dumps({"message": str(e)})}</chat-error>')
         await websocket.close()
         return
+
+    # In single-agent mode (no supervisor), store the agent name so that
+    # the ui_tools middleware knows the child is the direct target.
+    single_agent_name = ""
+    if not isinstance(agent, SupervisorGraph) and len(agents_metadata) == 1:
+        single_agent_name = agents_metadata[0].get("name", "")
 
     await websocket.send_text(build_chat_metadata(thread_id, agents_metadata, websocket))
 
@@ -101,13 +109,16 @@ async def websocket_endpoint(websocket: WebSocket, thread_id: str = None, llm: B
             request_id = str(uuid.uuid4())
 
             ws_request = _parse_websocket_request(request)
+            if not ws_request.agent and single_agent_name:
+                ws_request.agent = single_agent_name
             config = _build_config(base_config, request_id, ws_request)
-            input_data = await _build_input_data(agent, config, ws_request)
+            target_agent, target_config = _resolve_target_agent(agent, config, ws_request)
+            input_data = await _build_input_data(target_agent, target_config, ws_request)
 
             await _call_agent(
-                agent=agent,
+                agent=target_agent,
                 input_data=input_data,
-                config=config,
+                config=target_config,
                 websocket=websocket)
             
         except WebSocketDisconnect:
@@ -149,6 +160,8 @@ async def _call_agent(
         stream_mode=["updates", "messages", "custom", "events"],
     ):
         if stream["event"] == "on_chat_model_stream":
+            if not _should_stream_text(stream):
+                continue
             if text := _extract_streaming_text(stream):
                 await websocket.send_text(text)
         
@@ -164,24 +177,39 @@ async def _call_agent(
             if interrupt_value := _extract_interrupt_value(stream):
                 await websocket.send_text(interrupt_value)
 
+def _should_stream_text(stream: dict) -> bool:
+    """
+    Determines whether a chat model stream event should be forwarded to the WebSocket.
+
+    Returns False when:
+    - The event is tagged ``no-stream``: used by internal LLM calls (e.g. UI-tools
+      selection) that should never surface as visible text to the user.
+    - The event metadata marks it as coming from the summarization middleware
+      (``lc_source == "summarization"``): the SummarizationMiddleware compresses old
+      messages in the background and its LLM output is not part of the conversation.
+    """
+    # Internal calls tagged explicitly as non-streamable
+    if "no-stream" in stream.get("tags", []):
+        return False
+
+    # Background summarization calls from SummarizationMiddleware
+    if stream.get("metadata", {}).get("lc_source") == "summarization":
+        return False
+
+    return True
+
+
 def _extract_streaming_text(stream: dict) -> str | None:
     """
     Extracts text content from a chat model stream event.
-    
-    Only extracts text from 'agent' or 'model' nodes to avoid streaming
-    intermediate processing steps.
-    
+        
     Args:
         stream: The stream event dictionary from astream_events.
         
     Returns:
         The extracted text content, or None if not applicable.
     """
-    STREAMABLE_NODES = ("agent", "model")
-    
-    node = stream.get("metadata", {}).get("langgraph_node")
-    if node not in STREAMABLE_NODES:
-        return None
+
     
     chunk = stream.get("data", {}).get("chunk")
     if not chunk or not chunk.content:
@@ -221,7 +249,14 @@ def _extract_interrupt_value(stream: dict) -> str | None:
     if not interrupts:
         return None
     
-    return interrupts[0].value or None
+    value = interrupts[0].value
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value.get("message") or json.dumps(value)
+    if isinstance(value, str):
+        return value or None
+    return json.dumps(value)
     
 def _extract_text_from_chunk_content(chunk_content: any) -> str:
     """
@@ -270,8 +305,8 @@ def _parse_websocket_request(request: str) -> WebSocketRequest:
         if context:
             context_parts = [f"{key}:{value}" for key, value in context.items()]
             context_suffix = (
-                ". Use the following parameters to populate tool calls when appropriate. \n"
-                "Only include parameters relevant to the user's request "
+                CONTEXT_PARAMETERS_SUFFIX
+                + "Only include parameters relevant to the user's request "
                 "(e.g., omit namespace for cluster-wide operations). \n"
                 f"Parameters (separated by ;): \n {';'.join(context_parts)};"
             )
@@ -304,7 +339,6 @@ def _build_config(base_config: dict, request_id: str, ws_request: WebSocketReque
     Merges base configuration with request-specific settings including:
     - request_id for tracking individual requests
     - agent selection (if specified)
-    - ephemeral flag handling (prevents memory storage)
     - ui_tools configuration (name and list of tools sent from the client)
     
     Args:
@@ -318,6 +352,7 @@ def _build_config(base_config: dict, request_id: str, ws_request: WebSocketReque
     config = {
         **base_config,
         "configurable": {**base_config["configurable"]},
+        "recursion_limit": 50, # Prevent infinite recursion in case of misbehaving agents
     }
 
     config["configurable"]["request_id"] = request_id
@@ -334,13 +369,46 @@ def _build_config(base_config: dict, request_id: str, ws_request: WebSocketReque
         config["configurable"]["agent"] = ws_request.agent
     else:
         config["configurable"]["agent"] = ""
-
-    # Exclude "ephemeral" messages from being stored in memory
+    
+    # TODO remove ephemeral once welcome is in another API
     tags = ws_request.tags or []
     if "ephemeral" in tags:
         config["configurable"]["thread_id"] = ""
-    
+
     return config
+
+def _resolve_target_agent(
+    agent: CompiledStateGraph | SupervisorGraph,
+    config: dict,
+    ws_request: WebSocketRequest,
+) -> tuple[CompiledStateGraph, dict]:
+    """
+    Resolve which agent to call based on the request.
+
+    If ws_request.agent names a known child agent, returns that child's compiled graph
+    along with a config using the namespaced thread_id ``<parent>::child::<agent>`` (matching
+    the convention used by the supervisor). Otherwise, returns the supervisor agent and the original config.
+
+    Args:
+        agent: The supervisor (or single-agent) compiled graph.
+        config: The current run config.
+        ws_request: The parsed WebSocket request.
+
+    Returns:
+        A tuple of (target agent graph, config for that agent).
+    """
+    requested_agent = ws_request.agent
+    if not requested_agent:
+        return agent, config
+
+    if not hasattr(agent, "child_agents") or requested_agent not in agent.child_agents:
+        logging.debug(f"Requested agent '{requested_agent}' not found in child_agents, falling back to supervisor")
+        return agent, config
+
+    child_graph = agent.child_agents[requested_agent]
+
+    return child_graph, config
+
 
 async def _build_input_data(agent: CompiledStateGraph, config: dict, ws_request: WebSocketRequest) -> dict | Command:
     """
@@ -367,7 +435,8 @@ async def _build_input_data(agent: CompiledStateGraph, config: dict, ws_request:
             content=ws_request.prompt,
             additional_kwargs={
                 "request_id": config["configurable"]["request_id"],
-                "request_metadata": config["configurable"]["request_metadata"]
+                "request_metadata": config["configurable"]["request_metadata"],
+                "created_at": datetime.now().isoformat()
             }
         )
     ]

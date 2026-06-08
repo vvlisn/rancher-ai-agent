@@ -7,7 +7,7 @@ import json
 import logging
 from typing import Optional, List, Any
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.language_models.llms import BaseLanguageModel
+from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.tools import Tool
 from pydantic import create_model, Field
 
@@ -122,7 +122,7 @@ class UIToolsSelector:
     Added as step in the LangGraph workflow
     """
     
-    def __init__(self, llm: BaseLanguageModel, system_prompt: str, max_tools: int = 5):
+    def __init__(self, llm: BaseChatModel, system_prompt: str, max_tools: int = 5):
         """
         Initialize the UI Tools Selector
         
@@ -219,34 +219,35 @@ Each tool's description explains its scope. Follow it strictly."""
             self.system_prompt = f"{system_prompt}\n\n{default_prompt}"
         else:
             self.system_prompt = default_prompt
+        return self.system_prompt
             
-    def _build_text_prompt(self, agent_config: AgentConfig, context: str, mcp_response: Optional[str]) -> str:
+    def _build_text_prompt(self, context: str, mcp_response: Optional[str], mcp_data: Optional[str] = None) -> str:
         """Build the text prompt for the LLM based on the agent context and MCP response if available"""
-        return f"""Analyze this CONTEXT + MCP RESPONSE (if available) + the SELECTED AGENT used to perform the task, and select appropriate UI tools to enhance the response.
-
-SELECTED AGENT: name: {agent_config.displayName}, description: "{agent_config.description}"
+        return f"""Analyze this CONTEXT + MCP RESPONSE (if available) + MCP DATA (if available) + the SELECTED AGENT used to perform the task, and select appropriate UI tools to enhance the response.
 
 CONTEXT:
 {context}
 
 {f'MCP RESPONSE:{chr(10)}{mcp_response}' if mcp_response else ''}
 
+{f'MCP DATA:{chr(10)}{mcp_data}' if mcp_data else ''}
+
 If no tools are appropriate, do not invoke any tools."""
 
-    def select_tools(
+    async def select_tools(
         self,
-        agent_config: AgentConfig, # The agent used to permorm the user request, used to scope tool selection and for better prompt guidance
         context: str,  # Current response/context from agent
         mcp_response: Optional[str] = None,  # Raw MCP response if available for better tool selection
+        mcp_data: Optional[str] = None,  # Full MCP server response (last tool call)
         available_tools: Optional[List[UITool]] = None,
-    ) -> List[UIToolCall]:
+    ) -> List[dict]:
         """
         Use any LLM to select appropriate UI tools using bind_tools for structured output.
         
         Args:
-            agent_config: The agent configuration using this selector
             context: The response/context to enhance with UI tools
             mcp_response: Raw MCP response if available for better tool selection
+            mcp_data: Full data returned by the MCP server from the last tool call
             available_tools: List of available tools (uses all if not specified)
             
         Returns:
@@ -266,13 +267,17 @@ If no tools are appropriate, do not invoke any tools."""
             logging.debug(f"Calling LLM for UI tool selection with bind_tools. Available tools: {[t.name for t in available_tools]}")
             
             # Build the prompt with the agent, context and MCP response if available            
-            text_prompt = self._build_text_prompt(agent_config, context, mcp_response)
+            text_prompt = self._build_text_prompt(context, mcp_response, mcp_data)
             
             user_msg = HumanMessage(content=text_prompt)
             system_msg = SystemMessage(content=self.system_prompt)
             
-            # Call the LLM with bound tools
-            response = llm_with_tools.invoke([system_msg, user_msg])
+            # Call the LLM with bound tools, tagged as "no-stream" to prevent internal
+            # LLM call output from being sent to the client
+            response = await llm_with_tools.ainvoke(
+                [system_msg, user_msg],
+                config={"tags": ["no-stream"]}
+            )
             
             # Extract tool calls
             ui_tool_calls = self._extract_tool_calls_from_response(response, available_tools)
@@ -287,7 +292,7 @@ If no tools are appropriate, do not invoke any tools."""
         except Exception as e:
             logging.error(f"Error selecting UI tools with bind_tools: {e}")
             return []
-    
+
     def _extract_tool_calls_from_response(self, response: Any, available_tools: List[UITool]) -> List[UIToolCall]:
         """
         Extract tool calls from the LLM response when using bind_tools.
@@ -327,7 +332,7 @@ If no tools are appropriate, do not invoke any tools."""
         
         return ui_tool_calls
 
-    def _sanitize_ui_tools(self, ui_tool_calls: List[UIToolCall], available_tools: List[UITool]) -> list:
+    def _sanitize_ui_tools(self, ui_tool_calls: List[UIToolCall], available_tools: List[UITool]) -> List[dict]:
         """
         Sanitize UI tool calls by deduplicating and capping to max_tools.
         
@@ -388,6 +393,6 @@ If no tools are appropriate, do not invoke any tools."""
         return deduplicated_tools
 
 
-def create_ui_tools_selector(llm: BaseLanguageModel, system_prompt: str, max_tools: int = 5) -> UIToolsSelector:
+def create_ui_tools_selector(llm: BaseChatModel, system_prompt: str, max_tools: int = 5) -> UIToolsSelector:
     """Factory function to create a UI Tools Selector with any LLM"""
     return UIToolsSelector(llm, system_prompt, max_tools)

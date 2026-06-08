@@ -1,6 +1,8 @@
 from fastapi.testclient import TestClient
 from app.main import app
 from app.services.agent.loader import RANCHER_AGENT_PROMPT, AgentConfig, AuthenticationType
+from app.services.agent.child import CHILD_TOOL_USE_INSTRUCTIONS
+from app.services.agent.system_prompts import IDENTITY_PREAMBLE
 from app.services.llm import LLMManager
 from app.services.memory import StorageType
 from mcp.server.fastmcp import FastMCP
@@ -114,8 +116,9 @@ def test_websocket_single_prompt():
         assert messages == expected_messages_send_to_websocket
         assert len(fake_llm.all_calls) == 1, "Expected 1 LLM call"
         assert fake_llm.all_calls[0] == [
-            SystemMessage(content=RANCHER_AGENT_PROMPT),
+            SystemMessage(content=RANCHER_AGENT_PROMPT + CHILD_TOOL_USE_INSTRUCTIONS),
             HumanMessage(content="fake prompt"),
+            SystemMessage(content=IDENTITY_PREAMBLE),
         ], "First call should have system prompt and user message"
     finally:
         LLMManager._instance = None
@@ -152,12 +155,14 @@ def test_websocket_multiple_prompts():
         assert messages == expected_messages_send_to_websocket
         assert len(fake_llm.all_calls) == 2, "Expected 2 LLM calls"
         assert fake_llm.all_calls[0] == [
-            SystemMessage(content=RANCHER_AGENT_PROMPT),
+            SystemMessage(content=RANCHER_AGENT_PROMPT + CHILD_TOOL_USE_INSTRUCTIONS),
             HumanMessage(content="fake prompt 1"),
+            SystemMessage(content=IDENTITY_PREAMBLE),
         ], "First call should have system prompt and first user message"
         assert fake_llm.all_calls[1] == [
-            SystemMessage(content=RANCHER_AGENT_PROMPT),
+            SystemMessage(content=RANCHER_AGENT_PROMPT + CHILD_TOOL_USE_INSTRUCTIONS),
             HumanMessage(content="fake prompt 1"),
+            SystemMessage(content=IDENTITY_PREAMBLE),
             AIMessage(content="fake llm response 1"),
             HumanMessage(content="fake prompt 2"),
         ], "Second call should include conversation history"
@@ -200,20 +205,22 @@ def test_websocket_tool_call():
         assert messages == expected_messages_send_to_websocket
         assert len(fake_llm.all_calls) == 2, "Expected 2 LLM calls (initial + after tool)"
         assert fake_llm.all_calls[0] == [
-            SystemMessage(content=RANCHER_AGENT_PROMPT),
+            SystemMessage(content=RANCHER_AGENT_PROMPT + CHILD_TOOL_USE_INSTRUCTIONS),
             HumanMessage(content="sum 4 + 5"),
+            SystemMessage(content=IDENTITY_PREAMBLE),
         ], "First call should have system prompt and user message"
         # Second call includes tool call and result
         second_call = fake_llm.all_calls[1]
-        assert second_call[0] == SystemMessage(content=RANCHER_AGENT_PROMPT), "Second call should have system prompt"
+        assert second_call[0] == SystemMessage(content=RANCHER_AGENT_PROMPT + CHILD_TOOL_USE_INSTRUCTIONS), "Second call should have system prompt"
         assert second_call[1] == HumanMessage(content="sum 4 + 5"), "Second call should have user message"
-        assert isinstance(second_call[2], AIMessage) and second_call[2].tool_calls[0]["name"] == "add", "Second call should have AI message with tool call"
-        assert isinstance(second_call[3], ToolMessage) and second_call[3].content == "sum is 9", "Second call should have tool result"
+        assert second_call[2] == SystemMessage(content=IDENTITY_PREAMBLE), "Second call should have identity preamble"
+        assert isinstance(second_call[3], AIMessage) and second_call[3].tool_calls[0]["name"] == "add", "Second call should have AI message with tool call"
+        assert isinstance(second_call[4], ToolMessage) and second_call[4].content == "sum is 9", "Second call should have tool result"
     finally:
         LLMManager._instance = None
 
-def test_summary():
-    """Tests that conversation history is summarized after reaching the threshold."""
+def test_conversation_history():
+    """Tests that conversation history is maintained across multiple prompts."""
     fake_prompt_1 = "fake prompt 1"
     fake_prompt_2 = "fake prompt 2"
     fake_prompt_3 = "fake prompt 3"
@@ -225,7 +232,6 @@ def test_summary():
     fake_llm_response_3 = "fake llm response 3"
     fake_llm_response_4 = "fake llm response 4"
     fake_llm_response_5 = "fake llm response 5"
-    fake_summary_response = "This is a summary of the conversation so far."
 
     prompts = [fake_prompt_1, fake_prompt_2, fake_prompt_3, fake_prompt_4, fake_prompt_5]
     
@@ -234,7 +240,6 @@ def test_summary():
         AIMessage(content=fake_llm_response_2),
         AIMessage(content=fake_llm_response_3),
         AIMessage(content=fake_llm_response_4),
-        AIMessage(content=fake_summary_response),
         AIMessage(content=fake_llm_response_5),
     ]
     expected_messages_send_to_websocket = [
@@ -263,26 +268,29 @@ def test_summary():
                 messages.append(msg)
             
         assert messages == expected_messages_send_to_websocket
-        assert len(fake_llm.all_calls) == 6, "Expected 6 LLM calls (5 prompts + 1 summary)"
+        assert len(fake_llm.all_calls) == 5, "Expected 5 LLM calls (one per prompt)"
         
         # First call - just prompt 1
         assert fake_llm.all_calls[0] == [
-            SystemMessage(content=RANCHER_AGENT_PROMPT),
+            SystemMessage(content=RANCHER_AGENT_PROMPT + CHILD_TOOL_USE_INSTRUCTIONS),
             HumanMessage(content=fake_prompt_1),
+            SystemMessage(content=IDENTITY_PREAMBLE),
         ], "First call should have system prompt and first user message"
         
         # Second call - prompt 1 + response 1 + prompt 2
         assert fake_llm.all_calls[1] == [
-            SystemMessage(content=RANCHER_AGENT_PROMPT),
+            SystemMessage(content=RANCHER_AGENT_PROMPT + CHILD_TOOL_USE_INSTRUCTIONS),
             HumanMessage(content=fake_prompt_1),
+            SystemMessage(content=IDENTITY_PREAMBLE),
             AIMessage(content=fake_llm_response_1),
             HumanMessage(content=fake_prompt_2),
         ], "Second call should include conversation history"
         
         # Third call - full history up to prompt 3
         assert fake_llm.all_calls[2] == [
-            SystemMessage(content=RANCHER_AGENT_PROMPT),
+            SystemMessage(content=RANCHER_AGENT_PROMPT + CHILD_TOOL_USE_INSTRUCTIONS),
             HumanMessage(content=fake_prompt_1),
+            SystemMessage(content=IDENTITY_PREAMBLE),
             AIMessage(content=fake_llm_response_1),
             HumanMessage(content=fake_prompt_2),
             AIMessage(content=fake_llm_response_2),
@@ -291,8 +299,9 @@ def test_summary():
         
         # Fourth call - full history up to prompt 4
         assert fake_llm.all_calls[3] == [
-            SystemMessage(content=RANCHER_AGENT_PROMPT),
+            SystemMessage(content=RANCHER_AGENT_PROMPT + CHILD_TOOL_USE_INSTRUCTIONS),
             HumanMessage(content=fake_prompt_1),
+            SystemMessage(content=IDENTITY_PREAMBLE),
             AIMessage(content=fake_llm_response_1),
             HumanMessage(content=fake_prompt_2),
             AIMessage(content=fake_llm_response_2),
@@ -301,9 +310,11 @@ def test_summary():
             HumanMessage(content=fake_prompt_4),
         ], "Fourth call should include full conversation history"
         
-        # Fifth call - summary generation
+        # Fifth call - full history up to prompt 5
         assert fake_llm.all_calls[4] == [
+            SystemMessage(content=RANCHER_AGENT_PROMPT + CHILD_TOOL_USE_INSTRUCTIONS),
             HumanMessage(content=fake_prompt_1),
+            SystemMessage(content=IDENTITY_PREAMBLE),
             AIMessage(content=fake_llm_response_1),
             HumanMessage(content=fake_prompt_2),
             AIMessage(content=fake_llm_response_2),
@@ -311,15 +322,8 @@ def test_summary():
             AIMessage(content=fake_llm_response_3),
             HumanMessage(content=fake_prompt_4),
             AIMessage(content=fake_llm_response_4),
-            HumanMessage(content="Create a summary of the conversation above:")
-        ], "Fifth call should be summary generation with full conversation history (no system message)"
-        
-        # Sixth call - after summary, messages replaced by summary + new prompt
-        assert fake_llm.all_calls[5] == [
-            SystemMessage(content=RANCHER_AGENT_PROMPT),
-            SystemMessage(content=f"Conversation summary: {fake_summary_response}"),
             HumanMessage(content=fake_prompt_5),
-        ], "Sixth call should have summary replacing conversation history"
+        ], "Fifth call should include full conversation history"
         
     finally:
         LLMManager._instance = None
@@ -329,7 +333,6 @@ def test_websocket_with_ui_tools():
     """Tests agent with UI tools enabled, verifying both response and dispatch ui-tools messages."""
     from app.services.ui_tools.models import UITool, UIToolSchema, UIToolsConfig, UIToolsConfigData
     from app.services.agent.loader import AgentConfig, AuthenticationType
-    from app.services.agent.root import RootAgentBuilder
     from unittest.mock import patch, MagicMock
     import json
 
@@ -368,77 +371,69 @@ def test_websocket_with_ui_tools():
             ui_tools_selectors=["show-yaml"]  # Enable UI tools
         )
         
-        # Patch RootAgentBuilder to include child_agents attribute
-        original_init = RootAgentBuilder.__init__
-
-        def patched_init(self, *args, **kwargs):
-            original_init(self, *args, **kwargs)
-            if not hasattr(self, 'child_agents'):
-                self.child_agents = []
-
-        with patch.object(RootAgentBuilder, '__init__', patched_init):
-            with patch('app.services.agent.factory.load_agent_configs') as mock_load:
-                mock_load.return_value = [agent_config]
+        with patch('app.services.agent.factory.load_agent_configs') as mock_load:
+            mock_load.return_value = [agent_config]
+            
+            # Patch load_ui_tools_from_configmap to return our UI tools config
+            with patch('app.services.agent.middleware.ui_tools.load_ui_tools_from_configmap') as mock_load_configmap:
+                # Setup to return the UI tool and config directly
+                ui_tools_config = UIToolsConfigData(
+                    tools=[ui_tool],
+                    config=UIToolsConfig(enabled=True, max_tools=5, system_prompt="Select relevant UI tools")
+                )
+                mock_load_configmap.return_value = ui_tools_config
                 
-                # Patch load_ui_tools_from_configmap to return our UI tools config
-                with patch('app.services.agent.base.load_ui_tools_from_configmap') as mock_load_configmap:
-                    # Setup to return the UI tool and config directly
-                    ui_tools_config = UIToolsConfigData(
-                        tools=[ui_tool],
-                        config=UIToolsConfig(enabled=True, max_tools=5, system_prompt="Select relevant UI tools")
-                    )
-                    mock_load_configmap.return_value = ui_tools_config
+                # Mock the UI tools selector
+                with patch('app.services.agent.middleware.ui_tools.create_ui_tools_selector') as mock_selector_factory:
+                    mock_selector = MagicMock()
+                    mock_selector_factory.return_value = mock_selector
+                    # Mock select_tools to return a formatted UI tool
+                    mock_selector.select_tools = AsyncMock(return_value=[
+                        {
+                            "toolName": "show-yaml",
+                            "description": "Display resource in YAML format",
+                            "prompt": "Show resource YAML",
+                        }
+                    ])
                     
-                    # Mock the UI tools selector
-                    with patch('app.services.agent.base.create_ui_tools_selector') as mock_selector_factory:
-                        mock_selector = MagicMock()
-                        mock_selector_factory.return_value = mock_selector
-                        # Mock select_tools to return a formatted UI tool
-                        mock_selector.select_tools.return_value = [
-                            {
-                                "toolName": "show-yaml",
-                                "description": "Display resource in YAML format",
-                                "prompt": "Show resource YAML",
-                            }
-                        ]
-                        
-                        messages = []
-                        with client.websocket_connect("/v1/ws/messages") as websocket:
-                            # Consume any initial messages from the server (chat-metadata)
-                            websocket.receive_text()
+                    messages = []
+                    with client.websocket_connect("/v1/ws/messages") as websocket:
+                        # Consume any initial messages from the server (chat-metadata)
+                        websocket.receive_text()
 
-                            # Send JSON request with tools configuration
-                            request = json.dumps({
-                                "prompt": "show me the resource",
-                                "tools": {"name": "default", "tools": ["show-yaml"]}
-                            })
-                            websocket.send_text(request)
-                            
-                            # Collect ALL messages from the websocket until we get </message>
-                            msg = ""
-                            while True:
-                                chunk = websocket.receive_text()
-                                messages.append(chunk)
-                                msg += chunk
-                                if msg.endswith("</message>"):
-                                    break
+                        # Send JSON request with tools configuration
+                        request = json.dumps({
+                            "prompt": "show me the resource",
+                            "tools": {"name": "default", "tools": ["show-yaml"]}
+                        })
+                        websocket.send_text(request)
                         
-                        full_stream = "".join(messages)
-                        
-                        # Verify workflow correctness: response content in stream
-                        assert "Here is the resource information" in full_stream, "Response should contain LLM response"
-                        assert len(fake_llm.all_calls) == 1, "Expected 1 LLM call"
-                        assert fake_llm.all_calls[0][0].content == RANCHER_AGENT_PROMPT, "LLM should receive system prompt"
-                        assert "show me the resource" in fake_llm.all_calls[0][1].content, "LLM should receive user prompt"
-                        
-                        # Verify dispatch correctness: processing message sent
-                        assert "<processing-ui-tools/>" in full_stream, "Missing <processing-ui-tools/> dispatch message"
-                        
-                        # Verify UI tools were dispatched
-                        assert "<ui-tools>" in full_stream, "Missing <ui-tools> dispatch message"
-                        
-                        mock_load_configmap.assert_called(), "UI tools config should be loaded from ConfigMap"
-                        mock_selector_factory.assert_called(), "Selector factory should be called"
-                        mock_selector.select_tools.assert_called(), "Selector should select tools"
+                        # Collect ALL messages from the websocket until we get </message>
+                        msg = ""
+                        while True:
+                            chunk = websocket.receive_text()
+                            messages.append(chunk)
+                            msg += chunk
+                            if msg.endswith("</message>"):
+                                break
+                    
+                    full_stream = "".join(messages)
+                    
+                    # Verify workflow correctness: response content in stream
+                    assert "Here is the resource information" in full_stream, "Response should contain LLM response"
+                    assert len(fake_llm.all_calls) == 1, "Expected 1 LLM call"
+                    assert fake_llm.all_calls[0][0].content == RANCHER_AGENT_PROMPT + CHILD_TOOL_USE_INSTRUCTIONS, "LLM should receive system prompt"
+                    assert "show me the resource" in fake_llm.all_calls[0][1].content, "LLM should receive user prompt"
+                    assert fake_llm.all_calls[0][2].content == IDENTITY_PREAMBLE, "LLM should receive identity preamble"
+                    
+                    # Verify dispatch correctness: processing message sent
+                    assert "<processing-ui-tools/>" in full_stream, "Missing <processing-ui-tools/> dispatch message"
+                    
+                    # Verify UI tools were dispatched
+                    assert "<ui-tools>" in full_stream, "Missing <ui-tools> dispatch message"
+                    
+                    mock_load_configmap.assert_called(), "UI tools config should be loaded from ConfigMap"
+                    mock_selector_factory.assert_called(), "Selector factory should be called"
+                    mock_selector.select_tools.assert_called(), "Selector should select tools"
     finally:
         LLMManager._instance = None
