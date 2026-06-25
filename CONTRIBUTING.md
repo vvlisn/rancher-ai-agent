@@ -56,21 +56,6 @@ The following environment variables must be set at minimum to run the agent: `RA
 | `DB_ENABLED` | `false` | Set to `true` to use PostgreSQL for conversation memory instead of in-memory storage. |
 | `DB_CONNECTION_STRING` | `postgresql://user:pass@localhost/db` | PostgreSQL connection string. Required when `DB_ENABLED=true`. |
 
-**RAG (Retrieval-Augmented Generation)**
-
-| Variable | Example Value | Description |
-| :--- | :--- | :--- |
-| `ENABLE_RAG` | `true` | Enables RAG for documentation retrieval. |
-| `EMBEDDINGS_MODEL` | `nomic-embed-text` | Embedding model name used for RAG. |
-| `RAG_VECTORSTORE_DIR` | `/app/rag/vectorstore` | Directory to persist the Chroma vector store. Defaults to `/app/rag/vectorstore`. |
-| `RAG_DOCSTORE_DIR` | `/app/rag/docstore` | Directory to persist the document store. Defaults to `/app/rag/docstore`. |
-| `FLEET_DOCS_PATH` | `/fleet_docs` | Path to Fleet documentation files. Defaults to `/fleet_docs`. |
-| `RANCHER_DOCS_PATH` | `/rancher_docs` | Path to Rancher documentation files. Defaults to `/rancher_docs`. |
-| `RAG_CHILD_CHUNK_SIZE` | `500` | Token size for child document chunks. Defaults to `500`. |
-| `RAG_CHILD_CHUNK_OVERLAP` | `150` | Token overlap between child chunks. Defaults to `150`. |
-| `RAG_PARENT_CHUNK_SIZE` | `4000` | Token size for parent document chunks. Defaults to `4000`. |
-| `RAG_PARENT_CHUNK_OVERLAP` | `400` | Token overlap between parent chunks. Defaults to `400`. |
-
 **Observability (Optional)**
 
 | Variable | Example Value | Description |
